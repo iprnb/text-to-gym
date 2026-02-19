@@ -1,6 +1,7 @@
 # Text to Gym
 
 A Gradio-based tool that turns natural language domain descriptions into working [Gymnasium](https://gymnasium.farama.org/) environments — no RL expertise required.
+![CI](https://github.com/iprnb/text-to-gym/actions/workflows/tests.yml/badge.svg)
 
 <img width="1266" height="665" alt="image" src="https://github.com/user-attachments/assets/1b5b1c18-015c-4915-b45f-47fba223ab7f" />
 
