@@ -1,4 +1,4 @@
-# text-to-Gym-environment Design Pipeline
+# Text to Gym
 
 A Gradio-based tool that turns natural language domain descriptions into working [Gymnasium](https://gymnasium.farama.org/) environments — no RL expertise required.
 
@@ -64,10 +64,10 @@ Then open [http://127.0.0.1:7860](http://127.0.0.1:7860) in your browser.
 - `stable-baselines3` for runtime testing and training (Steps 5.7 & 6)
 
 
-## Note
-This repository contains early-stage research prototypes.
-APIs are incomplete and subject to change.
-The focus is on exploring system design and evaluation patterns.
+## Status
+
+Active development. Core pipeline is functional end-to-end.
+Contributions and feedback welcome — open an issue to get started.
 
 ---
 
