@@ -17,7 +17,10 @@ import traceback
 
 from llm import call_llm, parse_llm_response
 from prompts import CODE_GENERATION_SYSTEM, CODE_VALIDATION_SYSTEM, RUNTIME_DEBUG_SYSTEM
-from formatting import format_code_status, format_code_validation_report, format_runtime_test_report
+from formatting import (
+    format_code_status, format_code_validation_report, format_runtime_test_report,
+    format_pipeline_progress, _error_box,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,21 +40,29 @@ def _strip_markdown(code: str) -> str:
 
 def _class_name_from_spec(spec: dict) -> str:
     """Derive a PascalCase class name from the domain summary."""
-    # Hardcoded for now to ensure the name is readable.
-    return "CustomEnv"
+    import re
+    summary = spec.get("domain_summary", "") or spec.get("decision_maker", "")
+    words = re.findall(r"[A-Za-z]+", summary)
+    significant = [w for w in words if w.lower() not in {"a", "an", "the", "of", "for", "in", "to", "and", "or", "is", "are", "with"}]
+    name = "".join(w.capitalize() for w in significant[:3])
+    return (name + "Env") if name else "CustomEnv"
 
 
 # ---------------------------------------------------------------------------
 # Step 5 – Generate Gymnasium code
 # ---------------------------------------------------------------------------
 
-def generate_environment_code(specification_json: str, provider: str) -> tuple:
+def generate_environment_code(specification_json, provider: str) -> tuple:
     """
     Generate Gymnasium environment code from a validated specification.
     Returns ``(status_html, python_code_string)``.
+    Accepts either a JSON string or an already-parsed dict.
     """
     try:
-        spec = json.loads(specification_json)
+        if isinstance(specification_json, dict):
+            spec = specification_json
+        else:
+            spec = json.loads(specification_json)
         class_name = _class_name_from_spec(spec)
 
         code_gen_prompt = (
@@ -86,23 +97,21 @@ def generate_environment_code(specification_json: str, provider: str) -> tuple:
         return status_html, code
 
     except Exception as e:
-        err_html = (
-            f"<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'>"
-            f"<p style='color:#d32f2f !important;'><strong>Error generating code:</strong> {e}</p></div>"
-        )
-        return err_html, f"# Error occurred:\n# {e}\n\n{traceback.format_exc()}"
+        return _error_box(f"Error generating code: {e}"), f"# Error occurred:\n# {e}\n\n{traceback.format_exc()}"
 
 
 # ---------------------------------------------------------------------------
 # Step 5.5 – Validate generated code against the specification
 # ---------------------------------------------------------------------------
 
-def validate_code_against_spec(spec_json: str, code: str, provider: str) -> tuple:
+def validate_code_against_spec(spec_json, code: str, provider: str) -> tuple:
     """
     Ask the LLM to compare generated code against the spec.
     Returns ``(result_dict | None, raw_json_string)``.
     """
     try:
+        if isinstance(spec_json, dict):
+            spec_json = json.dumps(spec_json, indent=2)
         prompt = (
             f"## Environment Specification\n{spec_json}\n\n"
             f"## Generated Code\n```python\n{code}\n```\n\n"
@@ -290,16 +299,25 @@ def test_environment_runtime(code: str, num_steps: int = 1000) -> tuple:
             return False, {"output": str(e), "returncode": -1}
 
 
-def _debug_and_fix(code: str, error_info: dict, provider: str) -> tuple:
+def _debug_and_fix(code: str, error_info: dict, provider: str, attempt: int = 1) -> tuple:
     """
     Ask the LLM to diagnose a runtime error and return fixed code.
     Returns ``(fixed_code, diagnosis_string)``.
+
+    ``attempt`` is passed through to the prompt so the LLM knows this is a
+    retry and should try a different approach if the previous fix did not work.
     """
     try:
+        retry_note = (
+            f"\n\nNOTE: This is attempt {attempt}. A previous fix attempt did not resolve the error. "
+            "Try a different approach — look more carefully at the full traceback."
+            if attempt > 1
+            else ""
+        )
         prompt = (
             f"## Environment Code\n```python\n{code}\n```\n\n"
-            f"## Runtime Error\n{error_info['output']}\n\n"
-            "Find the bug and provide the complete fixed code."
+            f"## Runtime Error (full output)\n{error_info['output']}\n\n"
+            f"Find the root cause and provide the complete fixed code.{retry_note}"
         )
         response = call_llm(RUNTIME_DEBUG_SYSTEM, prompt, provider=provider)
         result = parse_llm_response(response)
@@ -322,16 +340,45 @@ def _debug_and_fix(code: str, error_info: dict, provider: str) -> tuple:
         return code, f"Error during debug: {e}"
 
 
+def apply_all_fixes(spec_json: str, code: str, provider: str) -> str:
+    """
+    Run Step 5.5 (code-vs-spec validation) and automatically apply ALL
+    critical and warning fixes.  Returns the patched code (or the original
+    if validation failed or no changes were needed).
+    """
+    result, _ = validate_code_against_spec(spec_json, code, provider)
+    if not result:
+        return code
+
+    mismatches = result.get("mismatches", [])
+    # Apply critical and warning fixes automatically; skip info-level ones
+    auto_ids = [
+        m["id"] for m in mismatches
+        if m.get("severity") in ("critical", "warning") and m.get("id")
+    ]
+    if not auto_ids:
+        print("✅ No critical/warning mismatches – skipping auto-fix")
+        return code
+
+    print(f"🔧 Auto-fixing {len(auto_ids)} mismatch(es): {auto_ids}")
+    return apply_fixes(spec_json, code, auto_ids, mismatches, provider)
+
+
 def run_runtime_testing(
     code: str, provider: str, max_rounds: int = 5, test_steps: int = 1000
 ) -> tuple:
     """
     Iteratively test and auto-fix the environment code.
     Returns ``(final_code, report_html, log_text)``.
+
+    Always runs up to ``max_rounds`` fix attempts.  The loop only exits early
+    on success, or if the LLM returns identical code on **two consecutive**
+    attempts (genuine stuck state).
     """
     log_entries: list[str] = []
     current_code = code
     all_rounds: list[dict] = []
+    identical_count = 0  # consecutive rounds where LLM made no change
 
     print(f"\n{'='*60}\nRUNTIME TESTING (max {max_rounds} rounds, {test_steps} steps each)\n{'='*60}")
 
@@ -348,22 +395,109 @@ def run_runtime_testing(
 
         error_output = error_info.get("output", "Unknown error")
         log_entries.append("❌ Runtime error detected")
-        log_entries.append(f"Error output (first 300 chars): {error_output[:300]}")
+        log_entries.append(f"Error: {error_output[:400]}")
         all_rounds.append({"round": round_num, "success": False, "error": error_output[:500], "diagnosis": "Running LLM debug..."})
-
-        log_entries.append("🔧 Asking LLM to debug and fix...")
-        fixed_code, diagnosis = _debug_and_fix(current_code, error_info, provider)
-        all_rounds[-1]["diagnosis"] = diagnosis
-
-        if fixed_code == current_code:
-            log_entries.append("⚠️ LLM did not change the code. Stopping.")
-            break
-
-        current_code = fixed_code
-        log_entries.append(f"✅ Fix applied: {diagnosis[:100]}")
 
         if round_num == max_rounds:
             log_entries.append(f"⚠️ Reached {max_rounds} rounds without success.")
+            break
+
+        log_entries.append("🔧 Asking LLM to debug and fix...")
+        fixed_code, diagnosis = _debug_and_fix(current_code, error_info, provider, attempt=round_num)
+        all_rounds[-1]["diagnosis"] = diagnosis
+
+        if fixed_code == current_code:
+            identical_count += 1
+            log_entries.append(f"⚠️ LLM made no change (attempt {identical_count}/2 with no progress).")
+            if identical_count >= 2:
+                log_entries.append("⛔ Stopping: LLM unable to produce a different fix.")
+                break
+            # Continue to the next round — maybe a fresh attempt with more context helps
+            log_entries.append("↩️ Retrying with updated context...")
+        else:
+            identical_count = 0
+            current_code = fixed_code
+            log_entries.append(f"✅ Fix applied: {diagnosis[:120]}")
 
     report_html = format_runtime_test_report(all_rounds, test_steps)
     return current_code, report_html, "\n".join(log_entries)
+
+
+# ---------------------------------------------------------------------------
+# Merged pipeline: Generate → Auto-check → Auto-test (Step 5 unified)
+# ---------------------------------------------------------------------------
+
+def generate_full_pipeline(specification_json: str, provider: str, test_steps: int = 1000, max_debug_rounds: int = 5):
+    """
+    Generator that runs the full Generate → Spec-check → Runtime-test pipeline
+    automatically, yielding live status updates.
+
+    Each yield: ``(progress_html, code_str, runtime_report_html, log_text)``
+    where ``code_str`` is always the latest version of the code.
+    """
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE    = "done"
+    ERROR   = "error"
+
+    def _progress(gen, chk, tst, msg="", fixes=0, rounds=0, passed=False):
+        return format_pipeline_progress(gen, chk, tst, msg, fixes, rounds, passed)
+
+    # Normalise: accept either a JSON string or an already-parsed dict
+    if isinstance(specification_json, dict):
+        specification_json = json.dumps(specification_json, indent=2)
+    if not specification_json or not specification_json.strip():
+        yield _error_box("Please validate specification first in Step 4!"), "", "", ""
+        return
+
+    # ── Stage 1: Generate ──────────────────────────────────────────────────
+    yield _progress(RUNNING, PENDING, PENDING, "⚙️ Generating environment code…"), "", "", ""
+
+    try:
+        status_html, code = generate_environment_code(specification_json, provider)
+    except Exception as e:
+        yield _progress(ERROR, PENDING, PENDING, f"Generation failed: {e}"), "", "", ""
+        return
+
+    if not code or code.startswith("# Error"):
+        yield _progress(ERROR, PENDING, PENDING, "Code generation returned an error."), "", status_html, ""
+        return
+
+    yield _progress(DONE, RUNNING, PENDING, "🔬 Checking code against spec…"), code, "", ""
+
+    # ── Stage 2: Auto-check & auto-fix ────────────────────────────────────
+    fixes_applied = 0
+    try:
+        result, _ = validate_code_against_spec(specification_json, code, provider)
+        if result:
+            mismatches = result.get("mismatches", [])
+            auto_ids = [
+                m["id"] for m in mismatches
+                if m.get("severity") in ("critical", "warning") and m.get("id")
+            ]
+            if auto_ids:
+                print(f"🔧 Auto-fixing {len(auto_ids)} mismatch(es)")
+                code = apply_fixes(specification_json, code, auto_ids, mismatches, provider)
+                fixes_applied = len(auto_ids)
+    except Exception as e:
+        print(f"Spec-check stage error (non-fatal): {e}")
+        # Non-fatal — continue to runtime test with current code
+
+    yield _progress(DONE, DONE, RUNNING, "🧪 Running runtime test…", fixes=fixes_applied), code, "", ""
+
+    # ── Stage 3: Runtime test ─────────────────────────────────────────────
+    final_code, report_html, log_text = run_runtime_testing(
+        code, provider, max_rounds=max_debug_rounds, test_steps=test_steps
+    )
+
+    # Determine how many debug rounds were used
+    rounds_used = log_text.count("🧪 Round")
+    passed = "SUCCESS:" in log_text or "✅ SUCCESS" in log_text
+
+    final_progress = _progress(
+        DONE, DONE, DONE if passed else ERROR,
+        "✅ Pipeline complete — ready to train!" if passed
+        else "⚠️ Pipeline complete — some runtime issues remain. You may still try training.",
+        fixes=fixes_applied, rounds=rounds_used, passed=passed,
+    )
+    yield final_progress, final_code, report_html, log_text

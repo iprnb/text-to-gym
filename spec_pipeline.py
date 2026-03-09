@@ -23,6 +23,7 @@ from formatting import (
     format_answers_summary,
     format_specification,
     format_validation_issues,
+    _error_box,
 )
 
 
@@ -56,7 +57,7 @@ def submit_description(
     """
     try:
         if not part_a_desc or not part_a_desc.strip():
-            err = "<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>⚠️ Error:</strong> Please provide Part A: Overall Description (required)</p></div>"
+            err = _error_box("Please provide Part A: Overall Description (required)")
             return err, "Error: Part A is required"
 
         example_text = (
@@ -94,7 +95,7 @@ def submit_description(
         llm_response = call_llm(CLARIFYING_QUESTIONS_SYSTEM, user_prompt, provider=provider)
 
         if llm_response.startswith("Error:"):
-            err = f"<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>⚠️ {llm_response}</strong></p></div>"
+            err = _error_box(llm_response)
             return err, llm_response
 
         questions_data = parse_llm_response(llm_response)
@@ -108,7 +109,7 @@ def submit_description(
 
     except Exception as e:
         error_trace = traceback.format_exc()
-        err = f"<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>⚠️ Unexpected Error:</strong> {e}</p></div>"
+        err = _error_box(f"Unexpected Error: {e}")
         print(error_trace)
         return err, error_trace
 
@@ -134,20 +135,21 @@ def process_answers(questions_json: str, *answers):
                     "answer": answer,
                 }
 
-        summary = "<div style='padding:20px;background-color:#e8f5e9;border-radius:8px;'>"
-        summary += "<h3 style='color:#2e7d32 !important;'>✅ Answers Collected</h3>"
-        summary += f"<p style='color:#000000 !important;'>You answered {len(answers_dict)} out of {len(questions)} questions.</p>"
-        summary += "<hr style='border-color:#81c784;'>"
+        from formatting import _THEME_CSS, _p
+        summary = _THEME_CSS
+        summary += "<div class='ttg-card ttg-card-success'>"
+        summary += "<h3 class='ttg-h3 ttg-success'>✅ Answers Collected</h3>"
+        summary += _p(f"You answered {len(answers_dict)} out of {len(questions)} questions.")
+        summary += "<hr class='ttg-hr'>"
         for key, value in answers_dict.items():
-            summary += f"<p style='color:#000000 !important;'><strong>{key}:</strong> {value['question']}</p>"
-            summary += f"<p style='margin-left:20px;color:#424242 !important;'><em>Answer: {value['answer']}</em></p>"
+            summary += _p(f"<strong>{key}:</strong> {value['question']}")
+            summary += _p(f"<em class='ttg-em'>Answer: {value['answer']}</em>")
         summary += "</div>"
 
         return summary, json.dumps(answers_dict, indent=2)
 
     except Exception as e:
-        err = f"<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>Error:</strong> {e}</p></div>"
-        return err, str(e)
+        return _error_box(f"Error: {e}"), str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -300,17 +302,17 @@ def validate_specification(
         )
 
         if not validation_data:
-            err = "<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>⚠️ Error:</strong> Could not parse validation response.</p></div>"
+            err = _error_box("Could not parse validation response.")
             return err, validation_json, None, updated_understanding
 
         status = validation_data.get("status", "needs_clarification")
         if status == "complete":
             html = format_specification(validation_data)
         else:
-            html = format_validation_issues(validation_data)
+            # html = format_validation_issues(validation_data)
+            html = "<div style='height:0px;'></div>"
 
         return html, validation_json, validation_data if status == "complete" else None, updated_understanding
 
     except Exception as e:
-        err = f"<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>Error:</strong> {e}</p></div>"
-        return err, traceback.format_exc(), None, current_understanding or {}
+        return _error_box(f"Error: {e}"), traceback.format_exc(), None, current_understanding or {}

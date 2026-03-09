@@ -1,17 +1,12 @@
 """
 Gradio UI – assembles all steps into a single tabbed interface.
 
-Builds the full multi-tab Gradio app covering:
-  Step 1   – Domain description input (Part A free-form + Part B structured)
-  Step 2   – Review LLM-generated clarifying questions
-  Step 3   – Answer clarifying questions
-  Step 4   – Validate specification (up to 2 rounds of follow-up)
-  Step 5   – Generate Gymnasium environment code
-  Step 5.5 – Validate generated code against the spec
-  Step 7   – Runtime test with SB3 and auto-debug
-  Step 6   – Training playground (PPO / SAC with live reward curve)
-
-Import ``demo`` from this module and call ``demo.launch()`` to run the app.
+Tab layout:
+  Step 1 – Domain description (Part A + Part B)
+  Step 2 – Clarifying questions WITH inline answer boxes (Q1/A1/Q2/A2… interleaved)
+  Step 3 – Validate specification (auto-triggered, single Re-validate button, inline follow-up Q&A)
+  Step 4 – Generate environment (auto generate → spec-check → runtime test in one click)
+  Step 5 – Training playground
 """
 
 import json
@@ -19,23 +14,164 @@ import traceback
 
 import gradio as gr
 
-from config import MODEL_PROVIDER, OLLAMA_API_KEY, OLLAMA_MODEL, OPENAI_API_KEY, OPENAI_MODEL
+from config import (
+    MODEL_PROVIDER, OLLAMA_API_KEY, OLLAMA_MODEL,
+    OPENAI_API_KEY, OPENAI_MODEL,
+    ALGORITHM_NAMES, ALGORITHM_ACTION_SPACE_SUPPORT,
+)
 from spec_pipeline import submit_description, process_answers, validate_specification
-from code_pipeline import generate_environment_code, validate_code_against_spec, apply_fixes, run_runtime_testing
+from code_pipeline import generate_full_pipeline, run_runtime_testing
 from training import run_training, stop_training
 from formatting import (
     format_answers_summary,
     format_round_limit,
-    format_code_validation_report,
     format_training_status,
+    _error_box,
+    _THEME_CSS,
+)
+
+# ---------------------------------------------------------------------------
+# Global CSS
+# ---------------------------------------------------------------------------
+
+_GLOBAL_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+body, .gradio-container, input, textarea, select, button, .prose,
+label, .label-wrap span {
+    font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+}
+h1, h2, h3, h4, h5 {
+    font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+    font-weight: 600; letter-spacing: -0.01em;
+}
+/* Ensure Gradio textbox text is always readable */
+textarea, input[type="text"] { color: var(--body-text-color) !important; }
+/* Tab labels */
+.tab-nav button { font-size: 0.88rem; font-weight: 500; }
+
+/* ── Loading spinner ──────────────────────────────────────────────────── */
+@keyframes ttg-spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+@keyframes ttg-pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.4; }
+}
+.ttg-spinner {
+    display: inline-block;
+    width: 22px; height: 22px;
+    border: 3px solid rgba(59,130,246,0.25);
+    border-top-color: #3b82f6;
+    border-radius: 50%;
+    animation: ttg-spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 10px;
+}
+.dark .ttg-spinner {
+    border-color: rgba(147,197,253,0.25);
+    border-top-color: #93c5fd;
+}
+.ttg-loading-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 18px; border-radius: 10px;
+    background: var(--background-fill-secondary, #f0f4ff);
+    border: 1px solid #93c5fd;
+    animation: ttg-pulse 1.8s ease-in-out infinite;
+    color: #1e3a5f;
+    font-weight: 500;
+}
+.dark .ttg-loading-row {
+    background: #1e3a5f;
+    border-color: #2d5a8e;
+    color: #bfdbfe;
+}
+"""
+
+
+def _algo_info(algo: str) -> str:
+    support = ALGORITHM_ACTION_SPACE_SUPPORT.get(algo, "both")
+    if support == "continuous":
+        return f"⚠️ **{algo}** requires a **continuous** (Box) action space. Use PPO or A2C for discrete spaces."
+    if support == "discrete":
+        return f"⚠️ **{algo}** requires a **discrete** action space."
+    return f"✅ **{algo}** works with both discrete and continuous action spaces."
+
+
+# ---------------------------------------------------------------------------
+# HTML helpers
+# ---------------------------------------------------------------------------
+
+_LOADING_HTML = (
+    _THEME_CSS
+    + "<div class='ttg-loading-row'>"
+    "<span class='ttg-spinner'></span>"
+    "<span>Thinking… this usually takes a few seconds.</span>"
+    "</div>"
+)
+
+_LOADING_HTML_PIPELINE = (
+    _THEME_CSS
+    + "<div class='ttg-loading-row'>"
+    "<span class='ttg-spinner'></span>"
+    "<span>Running pipeline… generating, checking, and testing your environment.</span>"
+    "</div>"
 )
 
 
-def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="RL Environment Design Pipeline", theme=gr.themes.Soft()) as demo:
+def _question_card_html(idx: int, q: dict, prefix: str = "Q") -> str:
+    """Render a single question card (without CSS — caller adds _THEME_CSS once)."""
+    pclass_map = {"high": "ttg-q-high", "medium": "ttg-q-medium", "low": "ttg-q-low"}
+    pclass = pclass_map.get(q.get("priority", "medium"), "ttg-q-medium")
+    fmt = q.get("format", "free_form")
 
-        gr.Markdown("# 🤖 RL Environment Design Pipeline")
-        gr.Markdown("### Transform your domain description into a working RL environment")
+    html = f"<div class='ttg-q-card {pclass}'>"
+    html += (
+        f"<p class='ttg-p'>"
+        f"<strong>{prefix}{idx}. [{q.get('category','other').upper()}]</strong> "
+        f"{q.get('question_text','N/A')}</p>"
+    )
+    if fmt == "multiple_choice" and q.get("options"):
+        html += "<ul style='margin:4px 0 4px 18px;'>"
+        for opt in q["options"]:
+            html += f"<li class='ttg-p'>{opt}</li>"
+        html += "</ul>"
+    elif fmt == "yes_no":
+        html += "<p class='ttg-p ttg-em'>Answer: Yes / No</p>"
+        if q.get("follow_up_question"):
+            cond = q.get("follow_up_condition", "yes")
+            html += f"<p class='ttg-p ttg-em' style='margin-left:16px;'>If {cond}: {q['follow_up_question']}</p>"
+    else:
+        html += "<p class='ttg-p ttg-em'>[Free-form answer]</p>"
+    html += "</div>"
+    return html
+
+
+def _followup_card_html(idx: int, q_text: str) -> str:
+    """Render a single follow-up question card (without CSS)."""
+    return (
+        f"<div class='ttg-q-card ttg-q-medium'>"
+        f"<p class='ttg-p'><strong>FQ{idx}.</strong> {q_text}</p>"
+        f"</div>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# UI builder
+# ---------------------------------------------------------------------------
+
+def build_demo() -> gr.Blocks:
+    with gr.Blocks(
+        title="Text to Gym",
+        theme=gr.themes.Soft(
+            font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
+        ),
+        css=_GLOBAL_CSS,
+    ) as demo:
+
+        gr.Markdown("# 🤖 Text to Gym")
+        gr.Markdown("### Transform a plain-language description into a working RL environment")
 
         with gr.Row():
             provider_dropdown = gr.Dropdown(
@@ -43,57 +179,58 @@ def build_demo() -> gr.Blocks:
                 value=MODEL_PROVIDER,
                 label="🔧 Model Provider",
                 info="Select which LLM to use.",
+                scale=1,
             )
-            with gr.Column():
+            with gr.Column(scale=2):
                 gr.Markdown(
-                    f"**Current Settings:**\n"
-                    f"- **Ollama:** `{OLLAMA_MODEL}` {'✅' if OLLAMA_API_KEY else '❌ (API key not set)'}\n"
-                    f"- **OpenAI:** `{OPENAI_MODEL}` {'✅' if OPENAI_API_KEY else '❌ (API key not set)'}"
+                    f"**Settings:**\n"
+                    f"- Ollama: `{OLLAMA_MODEL}` {'✅' if OLLAMA_API_KEY else '❌ key not set'}\n"
+                    f"- OpenAI: `{OPENAI_MODEL}` {'✅' if OPENAI_API_KEY else '❌ key not set'}"
                 )
 
-        # ----- Shared state -----
-        questions_json_state    = gr.State("")
-        part_a_desc_state       = gr.State("")
-        part_a_example_state    = gr.State("")
-        specification_state     = gr.State("")
-        validation_status_state = gr.State("")
-        understanding_state     = gr.State({})
-        validation_round_state  = gr.State(0)
-        code_state              = gr.State("")   # source-of-truth for generated code
-        # Flat list of {"question": ..., "answer": ...} dicts across ALL rounds.
-        # Passed to the LLM at each validation step so it never repeats a question.
-        qa_history_state        = gr.State([])
-        # Texts of the follow-up questions shown to the user in the last validation
-        # round, so we can record the exact wording in the history.
+        # ── Shared state ─────────────────────────────────────────────────────
+        questions_json_state     = gr.State("")
+        part_a_desc_state        = gr.State("")
+        part_a_example_state     = gr.State("")
+        specification_state      = gr.State("")
+        understanding_state      = gr.State({})
+        validation_round_state   = gr.State(0)
+        qa_history_state         = gr.State([])
         followup_questions_state = gr.State([])
-        with gr.Tabs():
+        # Pending HTML values — set by the slow LLM call, applied by the fast follow-up .then()
+        # so that gr.HTML components are NOT in the slow call's outputs (prevents loading spinners)
+        _pending_intro_state     = gr.State("")
+        _pending_display_state   = gr.State("")
+        _pending_section_state   = gr.State("")
+        # Step 5 state copies — decouples training inputs from UI components
+        # to avoid Gradio 6 event cross-firing when components are shared across handlers
+        algo_state               = gr.State("PPO")
+        timesteps_state          = gr.State(50_000)
+
+        with gr.Tabs() as tabs:
 
             # ================================================================
             # Step 1 – Describe domain
             # ================================================================
-            with gr.Tab("📝 Step 1: Describe Your Domain"):
-                gr.Markdown("## Part A: Overall System Description (Required)")
-                gr.Markdown("Describe your problem in your own words.")
-
+            with gr.Tab("📝 Step 1: Describe", id="tab1"):
+                gr.Markdown("## Part A: Overall Description *(required)*")
                 part_a_desc = gr.Textbox(
                     label="Your Domain Description",
                     placeholder=(
                         "Example: We have a data center cooling system. "
                         "Servers generate heat, and we need to keep temperature stable "
-                        "while minimising energy costs..."
+                        "while minimising energy costs…"
                     ),
                     lines=8,
                 )
-
                 gr.Markdown("### Optional: Example Scenario")
                 part_a_example = gr.Textbox(
                     label="Example Scenario (Optional)",
-                    placeholder="Describe a short sequence: what situation starts, what decisions get made, what changes, what's the outcome...",
+                    placeholder="Describe a short sequence: what starts, what decisions are made, what changes, what's the outcome…",
                     lines=4,
                 )
-
                 gr.Markdown("---")
-                gr.Markdown("## Part B: Detailed Questions (Optional but Recommended)")
+                gr.Markdown("## Part B: Detailed Questions *(optional but recommended)*")
 
                 with gr.Accordion("Show Example (Warehouse Robot)", open=False):
                     gr.Markdown("""
@@ -145,141 +282,157 @@ def build_demo() -> gr.Blocks:
                 b9_additional = gr.Textbox(label="Anything else important we should know?", placeholder="Constraints, rare events, domain-specific details, etc.", lines=3)
 
                 submit_btn = gr.Button("🚀 Submit & Generate Questions", variant="primary", size="lg")
+                step1_loading = gr.HTML(value="", visible=False)
 
             # ================================================================
-            # Step 2 – Review generated questions
+            # Step 2 – Questions + Answers (Q1/A1/Q2/A2 interleaved)
             # ================================================================
-            with gr.Tab("❓ Step 2: Clarifying Questions"):
-                gr.Markdown("## Generated Clarifying Questions")
-                gr.Markdown("Based on your description, here are the questions we need answered to build your environment.")
-                questions_display = gr.HTML()
-                with gr.Accordion("🔍 Debug: Raw JSON Response", open=False):
+            with gr.Tab("❓ Step 2: Questions & Answers", id="tab2"):
+
+                step2_intro = gr.HTML(
+                    value=(
+                        _THEME_CSS
+                        + "<div class='ttg-card ttg-card-info'>"
+                        "<p class='ttg-p'>Your questions will appear here once you submit your description.</p>"
+                        "</div>"
+                    )
+                )
+
+                # Interleaved: question card HTML + answer textbox, 10 pairs
+                q_cards = []   # gr.HTML — one per question slot
+                answer_fields = []  # gr.Textbox — one per question slot
+                for i in range(10):
+                    qc = gr.HTML(value="", visible=False)
+                    af = gr.Textbox(
+                        label=f"Your answer",
+                        placeholder="Type your answer here (leave empty to skip)",
+                        lines=2,
+                        visible=False,
+                    )
+                    q_cards.append(qc)
+                    answer_fields.append(af)
+
+                step2_loading = gr.HTML(value="", visible=False)
+
+                with gr.Accordion("🔍 Debug: Raw LLM Response", open=False):
                     raw_json_output = gr.Textbox(label="Raw LLM Output", lines=20)
 
-            # ================================================================
-            # Step 3 – Answer questions
-            # ================================================================
-            with gr.Tab("📋 Step 3: Answer Questions"):
-                gr.Markdown("## Answer the Clarifying Questions")
-                gr.Markdown("Match the question numbers from Step 2 (Q1, Q2, etc.). Leave blank if not applicable.")
+                submit_answers_btn = gr.Button("✅ Submit Answers", variant="primary", size="lg", visible=False)
 
-                answer_fields = []
-                for i in range(1, 11):
-                    with gr.Accordion(f"Question {i}", open=(i <= 3)):
-                        ans = gr.Textbox(
-                            label=f"Answer to Q{i}",
-                            placeholder="Your answer here (leave empty to skip)",
-                            lines=2,
-                        )
-                        answer_fields.append(ans)
-
-                submit_answers_btn = gr.Button("✅ Submit Answers", variant="primary", size="lg")
+                answers_json_state = gr.State("")
 
             # ================================================================
-            # Step 4 – Review & validate spec
+            # Step 3 – Validate spec
             # ================================================================
-            with gr.Tab("📊 Step 4: Review & Validate"):
-                gr.Markdown("## Review Your Answers & Validate Specification")
-                gr.Markdown("Submit your answers first, then click Validate. You have **2 rounds** of clarification.")
+            with gr.Tab("📊 Step 3: Validate Spec", id="tab3"):
 
-                answers_summary = gr.HTML()
-                with gr.Accordion("🔍 Debug: Answers JSON", open=False):
-                    answers_json_output = gr.Textbox(label="Answers JSON", lines=10)
+                step3_intro = gr.HTML(
+                    value=(
+                        _THEME_CSS
+                        + "<div class='ttg-card ttg-card-info'>"
+                        "<p class='ttg-p'>Validation results will appear here.</p>"
+                        "</div>"
+                    )
+                )
 
-                gr.Markdown("---")
-                validate_btn = gr.Button("🔍 Validate Specification", variant="secondary", size="lg")
-                validation_display = gr.HTML()
+                step3_loading = gr.HTML(value="", visible=False)
+                validation_display = gr.HTML(value="", visible=False)
 
+                # Follow-up section — interleaved FQ cards + answer boxes
+                followup_section = gr.HTML(value="", visible=False)  # header card
+
+                followup_cards = []   # gr.HTML per FQ slot
+                followup_fields = []  # gr.Textbox per FQ slot
+                for i in range(5):
+                    fqc = gr.HTML(value="", visible=False)
+                    fqf = gr.Textbox(
+                        label="Your answer",
+                        placeholder=f"Answer to follow-up question {i+1}",
+                        lines=3,
+                        visible=False,
+                    )
+                    followup_cards.append(fqc)
+                    followup_fields.append(fqf)
+
+                validate_btn = gr.Button("🔄 Re-validate", variant="primary", size="lg", visible=False)
+                
                 with gr.Accordion("🔍 Debug: Specification JSON", open=False):
                     specification_json_output = gr.Textbox(label="Specification JSON", lines=20)
-                with gr.Accordion("🧠 Current Environment Understanding", open=False):
-                    understanding_display = gr.JSON(label="Accumulated Understanding")
-
-                gr.Markdown("---")
-                gr.Markdown("### 📝 Follow-up Questions (If Needed)")
-                gr.Markdown("If the validation above shows follow-up questions, answer them below and re-validate:")
-
-                followup_fields = []
-                for i in range(1, 6):
-                    fq = gr.Textbox(
-                        label=f"Follow-up Answer {i}",
-                        placeholder=f"Answer to follow-up question {i} shown above (leave empty if no question {i})",
-                        lines=3,
-                    )
-                    followup_fields.append(fq)
-
-                submit_followup_btn = gr.Button("✅ Submit Follow-up Answers & Re-validate", variant="primary", size="lg")
+                with gr.Accordion("🧠 Accumulated Understanding", open=False):
+                    understanding_display = gr.JSON(label="Understanding")
 
             # ================================================================
-            # Step 5 – Generate code
+            # Step 4 – Generate + check + test (fully automatic)
             # ================================================================
-            with gr.Tab("🎯 Step 5: Generate Environment"):
-                gr.Markdown("## Generate Gymnasium Environment Code")
-                gr.Markdown("Once your specification is validated in Step 4, click below to generate the environment code.")
-                generate_env_btn = gr.Button("🚀 Generate Environment Code", variant="primary", size="lg")
-                code_status = gr.HTML()
-                code_output = gr.Code(label="Generated Environment Code", language="python", lines=30)
-
-            # ================================================================
-            # Step 5.5 – Validate code against spec
-            # ================================================================
-            with gr.Tab("🔬 Step 5.5: Validate Code"):
-                gr.Markdown("## Validate Code Against Specification")
-                gr.Markdown("Check that the generated code actually matches what you described. Catches hardcoded values, wrong ranges, missing reward components, etc.")
-
-                validate_code_btn = gr.Button("🔍 Check Code Against Spec", variant="secondary", size="lg")
-                validation_report_display = gr.HTML()
-
-                gr.Markdown("### 🛠️ Apply Fixes")
-                gr.Markdown("Enter the mismatch IDs you want to fix (comma-separated, e.g. `unique_id_1, unique_id_2`). IDs are shown in the report above.")
-                fix_ids_input = gr.Textbox(label="Mismatch IDs to Fix", placeholder="e.g. unique_id_1, unique_id_3", lines=1)
-                apply_fixes_btn = gr.Button("🔧 Apply Selected Fixes & Update Code", variant="primary")
-                fix_status = gr.HTML()
-
-                with gr.Accordion("🔍 Debug: Raw Validation JSON", open=False):
-                    validation_raw_json = gr.Textbox(label="Raw JSON", lines=15)
-
-                mismatches_state = gr.State([])
-
-            # ================================================================
-            # Step 5.7 – Runtime test
-            # ================================================================
-            with gr.Tab("🧪 Step 5.7: Runtime Test"):
-                gr.Markdown("## Runtime Testing & Auto-Debug")
+            with gr.Tab("🚀 Step 4: Generate & Test", id="tab4"):
+                gr.Markdown("## Generate Environment")
                 gr.Markdown(
-                    "**Comprehensive SB3 compatibility test:** Runs the environment through "
-                    "instantiation → reset → manual steps → SB3's `check_env()` → model creation → actual training. "
-                    "If errors occur, the LLM debugs and fixes them automatically (up to 5 rounds)."
+                    "One click runs the full pipeline automatically:\n"
+                    "1. **Generate** Gymnasium code from your spec\n"
+                    "2. **Spec-check** — auto-applies all critical & warning fixes\n"
+                    "3. **Runtime test** with SB3 — auto-debugs errors (up to 5 rounds)\n\n"
+                    "When done, head to **Step 5** to train."
                 )
 
                 with gr.Row():
-                    test_steps_slider = gr.Slider(minimum=100, maximum=5000, value=1000, step=100,
-                                                  label="Test Steps", info="How many environment steps to test")
-                    test_max_rounds_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1,
-                                                       label="Max Debug Rounds", info="Maximum fix attempts")
+                    test_steps_slider = gr.Slider(
+                        minimum=100, maximum=5000, value=1000, step=100,
+                        label="Test Steps",
+                        info="SB3 training steps used during runtime test",
+                    )
+                    max_debug_rounds_slider = gr.Slider(
+                        minimum=1, maximum=10, value=5, step=1,
+                        label="Max Debug Rounds",
+                        info="Max auto-fix attempts if runtime test fails",
+                    )
 
-                test_code_btn = gr.Button("🧪 Test & Auto-Fix Code", variant="primary", size="lg")
-                test_report_display = gr.HTML()
-                with gr.Accordion("📋 Test Log", open=False):
-                    test_log_output = gr.Textbox(label="Round-by-round test log", lines=15, interactive=False)
+                generate_env_btn = gr.Button("⚙️ Generate & Test Environment", variant="primary", size="lg")
+
+                pipeline_status = gr.HTML(
+                    value=_THEME_CSS + "<div class='ttg-card ttg-card-neutral'>"
+                    "<p class='ttg-p'>Click the button above to start.</p></div>"
+                )
+
+                # Compact code viewer inside accordion
+                with gr.Accordion("📄 View Generated Code", open=False):
+                    code_output = gr.Code(label="Generated Environment Code", language="python", lines=20)
+
+                with gr.Accordion("🧪 Runtime Test Report", open=False):
+                    runtime_report = gr.HTML()
+                with gr.Accordion("📋 Pipeline Log", open=False):
+                    pipeline_log = gr.Textbox(label="Log", lines=15, interactive=False)
+
+                code_state = gr.State("")
 
             # ================================================================
-            # Step 6 – Playground
+            # Step 5 – Training playground
             # ================================================================
-            with gr.Tab("🎮 Step 6: Playground"):
+            with gr.Tab("🎮 Step 5: Train", id="tab5"):
                 gr.Markdown("## Train & Visualise")
-                gr.Markdown("Train your environment with PPO or SAC and watch the reward curve live. Make sure Step 5.7 passes before training.")
+                gr.Markdown(
+                    "Train your environment with an SB3 algorithm and watch the reward curve live. "
+                    "Make sure **Step 4** completed successfully before training."
+                )
 
                 with gr.Row():
-                    algo_dropdown = gr.Dropdown(choices=["PPO", "SAC"], value="PPO", label="Algorithm",
-                                                info="PPO works for most environments. SAC requires continuous action spaces.")
-                    timesteps_slider = gr.Slider(minimum=10_000, maximum=500_000, value=50_000, step=10_000,
-                                                 label="Total Timesteps", info="More timesteps = longer training = better results")
+                    algo_dropdown = gr.Dropdown(
+                        choices=ALGORITHM_NAMES,
+                        value="PPO",
+                        label="Algorithm",
+                        info="SAC and TD3 require a continuous (Box) action space.",
+                    )
+                    timesteps_slider = gr.Slider(
+                        minimum=10_000, maximum=500_000, value=50_000, step=10_000,
+                        label="Total Timesteps",
+                        info="More timesteps = longer training = potentially better results",
+                    )
 
+                algo_info_display = gr.Markdown(_algo_info("PPO"))
+
+                start_training_btn = gr.Button("▶️ Start Training", variant="primary", size="lg", elem_id="start-training-btn")
                 with gr.Row():
-                    start_training_btn = gr.Button("▶️ Start Training", variant="primary", size="lg")
-                    stop_training_btn  = gr.Button("⏹️ Stop Training", variant="stop", size="lg")
-                    retest_btn         = gr.Button("🔄 Re-test & Fix Code", variant="secondary", size="lg")
+                    stop_training_btn  = gr.Button("⏹️ Stop Training", variant="stop", size="lg", elem_id="stop-training-btn")
+                    retest_btn         = gr.Button("🔄 Re-test & Fix Code", variant="secondary", size="lg", elem_id="retest-btn")
 
                 training_status = gr.HTML(value=format_training_status("idle", "Ready. Click Start Training to begin."))
                 reward_plot = gr.Plot(label="Reward Curve")
@@ -291,29 +444,20 @@ def build_demo() -> gr.Blocks:
                     retest_log    = gr.Textbox(label="Re-test log", lines=10, interactive=False)
 
         # --------------------------------------------------------------------
-        # About section
+        # About
         # --------------------------------------------------------------------
         gr.Markdown("""
 ---
-### 📚 About This Tool
-This pipeline helps domain experts create working RL environments from natural language descriptions.
-No RL expertise required – just describe your problem and the tool handles the technical details.
+### 📚 About
+Convert any decision-making problem description into a working Gymnasium environment — no RL expertise needed.
 
-### 🎯 Complete Workflow
-1. **Step 1:** Describe your domain in natural language
-2. **Step 2:** Review generated clarifying questions
-3. **Step 3:** Answer the questions
-4. **Step 4:** Validate specification (max 2 rounds of follow-ups)
-5. **Step 5:** Generate environment code
-6. **Step 5.5:** Validate code against spec, apply fixes if needed
-7. **Step 5.7:** Runtime test (runs 1 000 steps, auto-debugs errors)
-8. **Step 6:** Train with PPO/SAC, watch live curve
+**Workflow:** Step 1 → Step 2 → Step 3 → Step 4 → Step 5
 
 ### 🔧 Setup
 ```bash
-export OLLAMA_API_KEY="your-key"      # For Ollama Cloud
-export OPENAI_API_KEY="sk-..."        # For OpenAI
-export OLLAMA_MODEL="qwen3-next:80b"  # Change model
+export OLLAMA_API_KEY="your-key"
+export OPENAI_API_KEY="sk-..."
+export OLLAMA_MODEL="gpt-oss:120b"
 ```
 """)
 
@@ -321,23 +465,67 @@ export OLLAMA_MODEL="qwen3-next:80b"  # Change model
         # Event handlers
         # ====================================================================
 
-        # --- Step 1 submit ---
+        # ── Step 1: submit description ──────────────────────────────────────
+        def on_submit_loading():
+            """Show spinner immediately before the LLM call."""
+            return gr.update(value=_LOADING_HTML, visible=True)
+
         def on_submit(provider, desc, example, *part_b_args):
-            """Step 1 handler: build the clarifying-questions prompt and call the LLM.
+            _, raw_json = submit_description(provider, desc, example, *part_b_args)
 
-            Passes Part A and Part B fields to the spec pipeline, stores the returned
-            questions JSON in state, and navigates the user toward Step 3.
-            """
-            formatted, raw_json = submit_description(provider, desc, example, *part_b_args)
-            if not raw_json.startswith("Error") and not raw_json.startswith("==="):
-                formatted += (
-                    "<div style='padding:15px;background:#e3f2fd;border-radius:8px;margin-top:20px;'>"
-                    "<p style='color:#000000 !important;'>✅ <strong>Questions generated!</strong> "
-                    "Please go to <strong>Step 3</strong> to provide your answers.</p></div>"
+            try:
+                data = json.loads(raw_json) if not raw_json.startswith(("Error", "===")) else {}
+                questions = data.get("questions", [])
+                num_q = len(questions)
+            except Exception:
+                questions = []
+                num_q = 0
+
+            # Warm intro card shown at top of Step 2
+            if num_q > 0:
+                intro_html = (
+                    _THEME_CSS
+                    + "<div class='ttg-card ttg-card-success'>"
+                    "<p class='ttg-p'>Got it! Here are some follow-up questions to help me better understand your system. "
+                    "Answer as many as you can — leave any that don't apply empty.</p>"
+                    "</div>"
                 )
-            return formatted, raw_json, raw_json, desc, example
+            else:
+                intro_html = (
+                    _THEME_CSS
+                    + "<div class='ttg-card ttg-card-warning'>"
+                    "<p class='ttg-p'>Hmm, I couldn't generate questions from that description. "
+                    "Try adding more detail in Part A and resubmitting.</p>"
+                    "</div>"
+                )
 
+            # Build interleaved question card updates (10 slots)
+            q_card_updates = []
+            ans_updates = []
+            for i in range(10):
+                if i < num_q:
+                    card_html = _THEME_CSS + _question_card_html(i + 1, questions[i])
+                    q_card_updates.append(gr.update(value=card_html, visible=True))
+                    ans_updates.append(gr.update(visible=True, value=""))
+                else:
+                    q_card_updates.append(gr.update(value="", visible=False))
+                    ans_updates.append(gr.update(visible=False, value=""))
+
+            submit_btn_update = gr.update(visible=(num_q > 0))
+
+            return (
+                [raw_json, desc, example, intro_html, raw_json]
+                + q_card_updates
+                + ans_updates
+                + [submit_btn_update, gr.update(visible=False), gr.update(selected="tab2")]
+            )
+
+        # Show loading spinner first, then run the real work
         submit_btn.click(
+            fn=on_submit_loading,
+            inputs=[],
+            outputs=[step1_loading],
+        ).then(
             fn=on_submit,
             inputs=[
                 provider_dropdown,
@@ -351,278 +539,350 @@ export OLLAMA_MODEL="qwen3-next:80b"  # Change model
                 b7_starting, b7_variability,
                 b8_scope, b8_fixed, b9_additional,
             ],
-            outputs=[questions_display, raw_json_output, questions_json_state, part_a_desc_state, part_a_example_state],
+            outputs=(
+                [questions_json_state, part_a_desc_state, part_a_example_state,
+                 step2_intro, raw_json_output]
+                + q_cards
+                + answer_fields
+                + [submit_answers_btn, step1_loading, tabs]
+            ),
         )
 
-        # --- Step 3 collect answers ---
-        # Wrap process_answers so we can also build the initial qa_history from Q&A pairs.
-        def on_process_answers(questions_json, *answers):
-            """Step 3 handler: map raw answer strings to their question texts.
+        # ── Step 2: submit answers → auto-trigger validation ─────────────────
+        def on_submit_loading_step2():
+            """Show spinner in Step 2 while processing."""
+            return gr.update(value=_LOADING_HTML, visible=True)
 
-            Builds the answers dict and also constructs the initial qa_history list
-            (flat list of question/answer pairs) that is forwarded to the LLM at each
-            validation round to prevent repeated questions.
-            """
-            summary, answers_json_str = process_answers(questions_json, *answers)
+        def on_process_and_validate(provider, questions_json, answers_json_in, understanding,
+                                    round_num, qa_history, followup_questions, *answers):
+            """Process answers from Step 2, then immediately run the first validation round."""
+            # ── Part 1: process answers ────────────────────────────────────
+            _, answers_json_str = process_answers(questions_json, *answers)
 
-            # Build flat history list from the questions that were answered
             try:
                 questions_data = json.loads(questions_json) if questions_json else {}
                 questions = questions_data.get("questions", [])
-                history = []
-                for question, answer in zip(questions, answers):
-                    if answer and answer.strip():
-                        history.append({
-                            "question": question.get("question_text", ""),
-                            "answer": answer.strip(),
-                        })
+                history = [
+                    {"question": q.get("question_text", ""), "answer": a.strip()}
+                    for q, a in zip(questions, answers)
+                    if a and a.strip()
+                ]
             except Exception:
                 history = []
 
-            return summary, answers_json_str, history
+            # ── Part 2: run first validation round ────────────────────────
+            round_num = 1  # always round 1 when coming from Step 2
 
-        submit_answers_btn.click(
-            fn=on_process_answers,
-            inputs=[questions_json_state] + answer_fields,
-            outputs=[answers_summary, answers_json_output, qa_history_state],
-        )
+            try:
+                html, val_json, val_data, updated = validate_specification(
+                    "",  # desc stored in state — pass empty; spec_pipeline handles missing desc gracefully
+                    "",  # example — same
+                    questions_json, answers_json_str, provider,
+                    current_understanding={}, round_number=round_num,
+                    qa_history=history,
+                )
+            except Exception as e:
+                html = _error_box(f"Validation error: {e}")
+                val_json = ""
+                val_data = None
+                updated = {}
 
-        # --- Step 4 validate ---
-        def on_validate(desc, example, provider, questions_json, answers_json, understanding, round_num, qa_history):
-            """Step 4 handler: run one round of specification validation.
-
-            Updates the accumulated environment understanding, asks the LLM whether
-            the spec is complete, and either advances to 'complete' status or returns
-            follow-up questions. Enforces a hard cap of 2 validation rounds.
-            """
-            round_num += 1
-            print(f"\n{'='*60}\nVALIDATION ROUND {round_num}/2\n{'='*60}\n")
-
-            if round_num > 2:
-                limit_html = format_round_limit()
-                spec_json  = json.dumps(understanding, indent=2)
-                return limit_html, spec_json, spec_json, understanding, understanding, round_num, "complete", qa_history, []
-
-            html, val_json, val_data, updated = validate_specification(
-                desc, example, questions_json, answers_json, provider,
-                current_understanding=understanding, round_number=round_num,
-                qa_history=qa_history,
-            )
-
-            # Extract the follow-up question texts so the next round can record them precisely
-            followup_texts = []
+            fq_texts = []
             try:
                 parsed = json.loads(val_json) if val_json else {}
-                followup_texts = [fq.get("question", "") for fq in parsed.get("follow_up_questions", [])]
+                fq_texts = [fq.get("question", "") for fq in parsed.get("follow_up_questions", [])]
             except Exception:
                 pass
 
+            # Build follow-up card + textbox updates (5 slots)
+            if fq_texts:
+                fq_header = (
+                    _THEME_CSS
+                    + "<div class='ttg-card ttg-card-info'>"
+                    "<p class='ttg-p'>Great progress! Before we move on, I need a bit more info to make sure my understanding "
+                    "of the system matches yours. Please answer the questions below.</p>"
+                    "</div>"
+                )
+            else:
+                fq_header = ""
+
+            validate_btn_visible = bool(fq_texts)
+
             if val_data and val_data.get("status") == "complete":
                 spec_json = json.dumps(val_data.get("complete_specification", {}), indent=2)
-                return html, val_json, spec_json, updated, updated, round_num, "complete", qa_history, followup_texts
-            return html, val_json, "", updated, updated, round_num, "needs_clarification", qa_history, followup_texts
+                tab_target = gr.update(selected="tab4")
+            else:
+                spec_json = ""
+                tab_target = gr.update(selected="tab3")
 
-        validate_btn.click(
-            fn=on_validate,
-            inputs=[part_a_desc_state, part_a_example_state, provider_dropdown,
-                    questions_json_state, answers_json_output,
-                    understanding_state, validation_round_state, qa_history_state],
-            outputs=[validation_display, specification_json_output, specification_state,
-                     understanding_state, understanding_display,
-                     validation_round_state, validation_status_state, qa_history_state, followup_questions_state],
+            step3_intro_html = (
+                _THEME_CSS
+                + "<div class='ttg-card ttg-card-success'>"
+                "<p class='ttg-p'>Answers received! I've reviewed your responses below.</p>"
+                "</div>"
+            )
+            return (
+                answers_json_str, history,
+                step3_intro_html,                          # _pending_intro_state
+                html,                                      # _pending_display_state
+                fq_header,                                 # _pending_section_state
+                gr.update(visible=False),                  # step3_loading hidden
+                val_json, spec_json,
+                updated, updated,
+                round_num,
+                history,                                   # qa_history_state
+                fq_texts,                                  # followup_questions_state
+                gr.update(visible=validate_btn_visible),   # validate_btn
+                tab_target,
+            )
+
+        def on_step2_loading():
+            return gr.update(value=_LOADING_HTML, visible=True)
+
+        def on_step3_loading():
+            return gr.update(value=_LOADING_HTML, visible=True)
+
+        # Instant helper — renders FQ card/field visibility from state.
+        # Defined here so it can be used in both submit_answers_btn and validate_btn chains.
+        def apply_fq_updates(fq_texts):
+            updates = []
+            for i in range(5):
+                if i < len(fq_texts):
+                    card_html = _THEME_CSS + _followup_card_html(i + 1, fq_texts[i])
+                    updates.append(gr.update(value=card_html, visible=True))
+                    updates.append(gr.update(visible=True, value=""))
+                else:
+                    updates.append(gr.update(value="", visible=False))
+                    updates.append(gr.update(visible=False, value=""))
+            return updates
+
+        # Interleaved output list: [card0, field0, card1, field1, ...]
+        _fq_interleaved = []
+        for _c, _f in zip(followup_cards, followup_fields):
+            _fq_interleaved.extend([_c, _f])
+
+        def apply_all_display_updates(intro_html, display_html, section_html, fq_texts):
+            """Fast: applies all pending HTML + FQ card/field visibility. No LLM call."""
+            updates = [
+                gr.update(value=intro_html),
+                gr.update(value=display_html, visible=bool(display_html)),
+                gr.update(value=section_html, visible=bool(section_html)),
+            ]
+            updates += apply_fq_updates(fq_texts)
+            return updates
+
+        submit_answers_btn.click(
+            fn=on_step2_loading,
+            inputs=[],
+            outputs=[step2_loading],
+        ).then(
+            fn=on_process_and_validate,
+            inputs=(
+                [provider_dropdown,
+                 questions_json_state, answers_json_state,
+                 understanding_state, validation_round_state,
+                 qa_history_state, followup_questions_state]
+                + answer_fields
+            ),
+            outputs=[
+                answers_json_state, qa_history_state,
+                _pending_intro_state,
+                _pending_display_state,
+                _pending_section_state,
+                step3_loading,
+                specification_json_output, specification_state,
+                understanding_state, understanding_display,
+                validation_round_state,
+                qa_history_state,
+                followup_questions_state,
+                validate_btn,
+                tabs,
+            ],
+        ).then(
+            fn=apply_all_display_updates,
+            inputs=[_pending_intro_state, _pending_display_state,
+                    _pending_section_state, followup_questions_state],
+            outputs=[step3_intro, validation_display, followup_section] + _fq_interleaved,
         )
 
-        # --- Step 4 follow-up submit ---
-        def on_submit_followup(desc, example, provider, questions_json,
-                               original_answers_json, understanding, round_num,
-                               qa_history, followup_questions,
-                               *followup_answers):
-            """Step 4 follow-up handler: merge follow-up answers and re-validate.
+        # ── Step 3: re-validate (follow-up answers) ───────────────────────────
+        def on_validate(provider, desc, example, questions_json,
+                        answers_json, understanding, round_num, qa_history,
+                        followup_questions, *followup_answers):
+            """Re-validate after the user answers follow-up questions in Step 3."""
 
-            Appends follow-up Q&A pairs to qa_history (using the stored question texts
-            so the LLM sees exact wording), increments the round counter, and calls
-            validate_specification again. If the round limit is reached, proceeds with
-            the current understanding using reasonable defaults.
-            """
+            def _fq_hide():
+                cards = [gr.update(value="", visible=False) for _ in followup_cards]
+                fields = [gr.update(visible=False, value="") for _ in followup_fields]
+                return cards + fields
+
             try:
-                original_answers = json.loads(original_answers_json) if original_answers_json else {}
-                followup_count = 0
+                original_answers = json.loads(answers_json) if answers_json else {}
                 new_history_pairs = []
-
                 for i, answer in enumerate(followup_answers, 1):
                     if answer and answer.strip():
-                        followup_count += 1
                         key = f"FQ{i}_round{round_num}"
-                        # Use the actual question text if we stored it, else fall back to a label
                         q_text = (
                             followup_questions[i - 1]
-                            if followup_questions and i - 1 < len(followup_questions)
-                            else f"Follow-up question {i} (round {round_num})"
+                            if i - 1 < len(followup_questions)
+                            else f"Follow-up question {i}"
                         )
-                        original_answers[key] = {
-                            "question": q_text,
-                            "answer": answer,
-                            "round": round_num,
-                        }
+                        original_answers[key] = {"question": q_text, "answer": answer, "round": round_num}
                         new_history_pairs.append({"question": q_text, "answer": answer.strip()})
 
                 updated_history = list(qa_history or []) + new_history_pairs
                 updated_answers_json = json.dumps(original_answers, indent=2)
                 round_num += 1
-                print(f"\n{'='*60}\nFOLLOW-UP VALIDATION ROUND {round_num}/2\n{'='*60}\n")
 
                 if round_num > 2:
-                    limit_html = format_round_limit()
-                    spec_json  = json.dumps(understanding, indent=2)
-                    summary    = format_answers_summary(original_answers, followup_count)
-                    return (summary, updated_answers_json,
-                            limit_html, spec_json, spec_json,
-                            understanding, understanding, round_num, "complete", updated_history, [])
+                    html = format_round_limit()
+                    spec_json = json.dumps(understanding, indent=2)
+                    return (
+                        updated_answers_json,
+                        html,                              # _pending_display_state
+                        "",                                # _pending_section_state (empty)
+                        gr.update(visible=False),          # step3_loading hidden
+                        spec_json, spec_json,
+                        understanding, understanding, round_num,
+                        updated_history, [],               # clear followup_questions_state
+                        gr.update(visible=False),
+                        gr.update(selected="tab4"),
+                    )
 
                 html, val_json, val_data, updated = validate_specification(
                     desc, example, questions_json, updated_answers_json, provider,
                     current_understanding=understanding, round_number=round_num,
                     qa_history=updated_history,
                 )
-                summary = format_answers_summary(original_answers, followup_count)
 
-                # Extract next round's follow-up question texts
-                next_followup_texts = []
+                next_fq_texts = []
                 try:
                     parsed = json.loads(val_json) if val_json else {}
-                    next_followup_texts = [fq.get("question", "") for fq in parsed.get("follow_up_questions", [])]
+                    next_fq_texts = [fq.get("question", "") for fq in parsed.get("follow_up_questions", [])]
                 except Exception:
                     pass
 
+                if next_fq_texts:
+                    fq_header = (
+                        _THEME_CSS
+                        + "<div class='ttg-card ttg-card-info'>"
+                        "<p class='ttg-p'>Almost there! Just a couple more things to clarify.</p>"
+                        "</div>"
+                    )
+                else:
+                    fq_header = ""
+
                 if val_data and val_data.get("status") == "complete":
                     spec_json = json.dumps(val_data.get("complete_specification", {}), indent=2)
-                    return (summary, updated_answers_json,
-                            html, val_json, spec_json,
-                            updated, updated, round_num, "complete", updated_history, next_followup_texts)
+                    tab_target = gr.update(selected="tab4")
+                else:
+                    spec_json = ""
+                    tab_target = gr.update(selected="tab3")
 
-                return (summary, updated_answers_json,
-                        html, val_json, "",
-                        updated, updated, round_num, "needs_clarification", updated_history, next_followup_texts)
+                return (
+                    updated_answers_json,
+                    html,                              # _pending_display_state
+                    fq_header,                         # _pending_section_state
+                    gr.update(visible=False),          # step3_loading hidden
+                    val_json, spec_json,
+                    updated, updated, round_num,
+                    updated_history, next_fq_texts,
+                    gr.update(visible=bool(next_fq_texts)),
+                    tab_target,
+                )
 
             except Exception as e:
-                error = f"<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>Error:</strong> {e}</p></div>"
-                return (error, original_answers_json,
-                        error, traceback.format_exc(), "",
-                        understanding, understanding, round_num, "error", qa_history, followup_questions)
+                error = _error_box(f"Error: {e}\n{traceback.format_exc()}")
+                return (
+                    answers_json,
+                    error,                             # _pending_display_state
+                    "",                                # _pending_section_state
+                    gr.update(visible=False),          # step3_loading hidden
+                    "", "",
+                    understanding, understanding, round_num,
+                    qa_history, [],
+                    gr.update(visible=False),
+                    gr.update(selected="tab3"),
+                )
 
-        submit_followup_btn.click(
-            fn=on_submit_followup,
-            inputs=[part_a_desc_state, part_a_example_state, provider_dropdown,
-                    questions_json_state, answers_json_output,
-                    understanding_state, validation_round_state,
-                    qa_history_state, followup_questions_state] + followup_fields,
-            outputs=[answers_summary, answers_json_output,
-                     validation_display, specification_json_output, specification_state,
-                     understanding_state, understanding_display,
-                     validation_round_state, validation_status_state,
-                     qa_history_state, followup_questions_state],
+        validate_btn.click(
+            fn=on_step3_loading,
+            inputs=[],
+            outputs=[step3_loading],
+        ).then(
+            fn=on_validate,
+            inputs=[
+                provider_dropdown,
+                part_a_desc_state, part_a_example_state,
+                questions_json_state, answers_json_state,
+                understanding_state, validation_round_state,
+                qa_history_state, followup_questions_state,
+            ] + followup_fields,
+            outputs=[
+                answers_json_state,
+                _pending_display_state,
+                _pending_section_state,
+                step3_loading,
+                specification_json_output, specification_state,
+                understanding_state, understanding_display,
+                validation_round_state,
+                qa_history_state, followup_questions_state,
+                validate_btn,
+                tabs,
+            ],
+        ).then(
+            fn=apply_all_display_updates,
+            inputs=[_pending_intro_state, _pending_display_state,
+                    _pending_section_state, followup_questions_state],
+            outputs=[step3_intro, validation_display, followup_section] + _fq_interleaved,
         )
 
-        # --- Step 5 generate code ---
-        def on_generate_code(spec_json, provider):
-            """Step 5 handler: generate Gymnasium environment code from the validated spec.
+        # ── Step 4: generate pipeline (generator) ────────────────────────────
+        def on_generate_pipeline(spec_json, provider, test_steps, max_rounds):
+            if not spec_json or not spec_json.strip():
+                err = _error_box("Please complete Step 3 (validate spec) first!")
+                yield err, "", "", "", ""
+                return
 
-            Guards against missing specification and stores the generated code in
-            code_state, which is the single source of truth for all downstream steps.
-            """
-            if not spec_json:
-                err = "<div style='padding:20px;background-color:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'><strong>Error:</strong> Please validate specification first in Step 4!</p></div>"
-                return err, "", ""
-            status_html, code = generate_environment_code(spec_json, provider)
-            return status_html, code, code
+            # Show loading state immediately
+            yield _LOADING_HTML_PIPELINE, "", "", "", ""
+
+            for progress_html, code, report_html, log_text in generate_full_pipeline(
+                spec_json, provider,
+                test_steps=int(test_steps),
+                max_debug_rounds=int(max_rounds),
+            ):
+                yield progress_html, code, report_html, log_text, code
 
         generate_env_btn.click(
-            fn=on_generate_code,
-            inputs=[specification_state, provider_dropdown],
-            outputs=[code_status, code_output, code_state],
+            fn=on_generate_pipeline,
+            inputs=[specification_state, provider_dropdown,
+                    test_steps_slider, max_debug_rounds_slider],
+            outputs=[pipeline_status, code_output, runtime_report, pipeline_log, code_state],
         )
 
-        # --- Step 5.7 runtime test ---
-        def on_test_code(code, test_steps, max_rounds, provider):
-            """Step 5.7 handler: run the environment through a full SB3 compatibility test.
+        # ── Algorithm info + sync algo/timesteps into state ─────────────────
+        def _on_algo_change(algo):
+            return _algo_info(algo), algo
 
-            Executes the code in a subprocess, runs up to max_rounds of LLM-assisted
-            auto-debugging if errors are found, and updates code_state with the fixed
-            version so Step 6 always trains on the latest code.
-            """
-            if not code or not code.strip():
-                err = "<div style='padding:20px;background:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'>Please generate code in Step 5 first.</p></div>"
-                return err, "", code, code
-            final_code, report_html, log_text = run_runtime_testing(code, provider, max_rounds=int(max_rounds), test_steps=int(test_steps))
-            return report_html, log_text, final_code, final_code
-
-        test_code_btn.click(
-            fn=on_test_code,
-            inputs=[code_state, test_steps_slider, test_max_rounds_slider, provider_dropdown],
-            outputs=[test_report_display, test_log_output, code_output, code_state],
+        algo_dropdown.change(
+            fn=_on_algo_change,
+            inputs=[algo_dropdown],
+            outputs=[algo_info_display, algo_state],
         )
 
-        # --- Step 5.5 validate code ---
-        def on_validate_code(spec_json, code, provider):
-            """Step 5.5 handler: ask the LLM to find mismatches between code and spec.
-
-            Returns a formatted mismatch report and stores the raw mismatches list in
-            mismatches_state so the apply-fixes handler can reference them by ID.
-            """
-            if not spec_json:
-                err = "<div style='padding:20px;background:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'>Please complete Step 4 (validation) first.</p></div>"
-                return err, "[]", err, []
-            if not code or not code.strip():
-                err = "<div style='padding:20px;background:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'>Please generate code in Step 5 first.</p></div>"
-                return err, "[]", err, []
-
-            result, raw_json = validate_code_against_spec(spec_json, code, provider)
-            if not result:
-                err = "<div style='padding:20px;background:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'>Could not parse validation response. See debug output.</p></div>"
-                return err, raw_json, err, []
-
-            report_html = format_code_validation_report(result)
-            return report_html, raw_json, "", result.get("mismatches", [])
-
-        validate_code_btn.click(
-            fn=on_validate_code,
-            inputs=[specification_state, code_state, provider_dropdown],
-            outputs=[validation_report_display, validation_raw_json, fix_status, mismatches_state],
+        timesteps_slider.change(
+            fn=lambda v: v,
+            inputs=[timesteps_slider],
+            outputs=[timesteps_state],
         )
 
-        # --- Step 5.5 apply fixes ---
-        def on_apply_fixes(spec_json, code, fix_ids_str, mismatches, provider):
-            """Step 5.5 fix handler: apply a user-selected subset of mismatches to the code.
-
-            Parses the comma-separated mismatch IDs, asks the LLM to apply only those
-            specific fixes, validates the result parses as valid Python, and updates
-            both code_output and code_state.
-            """
-            if not fix_ids_str or not fix_ids_str.strip():
-                return (
-                    "<div style='padding:15px;background:#fff3cd;border-radius:8px;'><p style='color:#f57c00 !important;'>No IDs entered. Please enter mismatch IDs to fix.</p></div>",
-                    code, code,
-                )
-            selected_ids = [x.strip() for x in fix_ids_str.split(",") if x.strip()]
-            fixed_code   = apply_fixes(spec_json, code, selected_ids, mismatches, provider)
-
-            if fixed_code == code:
-                status = "<div style='padding:15px;background:#fff3cd;border-radius:8px;'><p style='color:#f57c00 !important;'>⚠️ No changes made. IDs may not match or fixes were identical to existing code.</p></div>"
-            else:
-                status = f"<div style='padding:15px;background:#e8f5e9;border-radius:8px;'><p style='color:#2e7d32 !important;'>✅ Applied fixes for: {', '.join(selected_ids)}. Code updated in Step 5.</p></div>"
-
-            return status, fixed_code, fixed_code
-
-        apply_fixes_btn.click(
-            fn=on_apply_fixes,
-            inputs=[specification_state, code_state, fix_ids_input, mismatches_state, provider_dropdown],
-            outputs=[fix_status, code_output, code_state],
-        )
-
-        # --- Step 6 training ---
+        # ── Step 5: training ─────────────────────────────────────────────────
+        # Use state copies of algo/timesteps to avoid Gradio 6 cross-firing
+        # when components are shared as inputs across multiple event handlers.
         start_training_btn.click(
             fn=run_training,
-            inputs=[code_state, algo_dropdown, timesteps_slider, provider_dropdown],
+            inputs=[code_state, algo_state, timesteps_state, provider_dropdown],
             outputs=[training_status, reward_plot, training_logs],
         )
 
@@ -632,22 +892,18 @@ export OLLAMA_MODEL="qwen3-next:80b"  # Change model
             outputs=[training_status],
         )
 
-        def on_retest_playground(code, provider):
-            """Step 6 re-test handler: re-run runtime testing from the training playground.
-
-            Convenience wrapper around run_runtime_testing so users can fix and re-test
-            without switching tabs. Updates code_state with any auto-fixed version.
-            """
+        def on_retest(code, provider):
             if not code or not code.strip():
-                err = "<div style='padding:20px;background:#ffe6e6;border-radius:8px;'><p style='color:#d32f2f !important;'>No code to test.</p></div>"
-                return err, "", code, code
-            final_code, report_html, log_text = run_runtime_testing(code, provider, max_rounds=5, test_steps=1000)
-            return report_html, log_text, final_code, final_code
+                return _error_box("No code to test."), "", code
+            final_code, report_html, log_text = run_runtime_testing(
+                code, provider, max_rounds=5, test_steps=1000
+            )
+            return report_html, log_text, final_code
 
         retest_btn.click(
-            fn=on_retest_playground,
+            fn=on_retest,
             inputs=[code_state, provider_dropdown],
-            outputs=[retest_report, retest_log, code_output, code_state],
+            outputs=[retest_report, retest_log, code_state],
         )
 
     return demo

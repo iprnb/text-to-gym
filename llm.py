@@ -87,9 +87,9 @@ def call_openai(system_prompt: str, user_prompt: str, model: str = OPENAI_MODEL)
 def call_llm(system_prompt: str, user_prompt: str, provider: str = MODEL_PROVIDER) -> str:
     """Dispatch to the configured LLM provider."""
     if provider == "ollama":
-        return call_ollama(system_prompt, user_prompt)
+        return call_ollama(system_prompt, user_prompt, model=OLLAMA_MODEL)
     if provider == "openai":
-        return call_openai(system_prompt, user_prompt)
+        return call_openai(system_prompt, user_prompt, model=OPENAI_MODEL)
     return f"Error: Unknown provider '{provider}'."
 
 

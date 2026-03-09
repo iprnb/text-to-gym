@@ -31,12 +31,13 @@ QUESTION FORMAT GUIDELINES:
 - Use free-form only when answer space is truly open-ended
 - Group related questions together
 - Use domain language, not RL jargon
+- Questions with dependencies should be noted via follow_up_condition rather than asked  as separate top-level questions.
 
 DO NOT:
 - Ask more than 10 questions
 - Ask about details that can have reasonable defaults
 - Use RL terminology unless the user has already used it
-- Request trajectory examples unless dynamics are genuinely unclear
+- Request trajectory examples unless dynamics are genuinely unclear. trajectory_needed must be false if the user already provided an example scenario in Part A.
 
 OUTPUT FORMAT:
 Generate questions in a structured JSON format. Your response must be ONLY valid JSON with no additional text before or after."""
@@ -133,6 +134,16 @@ Your task is to UPDATE the understanding by:
 - Marking fields as confirmed when user has explicitly answered them
 - Keeping track of what is still unclear
 
+DO NOT ask the user about technical implementation details such as:
+- Observation encoding formats (integer IDs, one-hot, RGB, etc.)
+- Data types (float32, int64, etc.)
+- Space types (Box, Discrete, MultiDiscrete, Dict, etc.)
+- Array shapes or dimensions
+- Numpy or gymnasium-specific implementation choices
+
+These are engineering decisions. Infer the best encoding from the domain 
+description and apply it automatically using your expertise.
+
 OUTPUT FORMAT (JSON only, no other text):
 {{
   "domain_summary": "Brief summary of the domain",
@@ -195,8 +206,8 @@ You have access to:
 3. ALL question-answer pairs from every previous round (initial + all follow-ups)
 
 Your task:
-1. Check if the understanding is complete enough to generate a Gymnasium environment
-2. If NOT complete, generate follow-up questions ONLY about things still marked as unclear or unconfirmed
+1. ALWAYS populate reward_hacking_check with a minimum of 2 potential_exploits and 2 mitigations, regardless of whether the spec is complete or not. This field is mandatory and must never be empty.
+2. Check if the understanding is complete enough. If NOT complete, generate follow-up questions ONLY about things still marked as unclear or unconfirmed
 3. NEVER ask about things already confirmed in the understanding
 4. NEVER repeat or rephrase a question that was already asked and answered in the Q&A history
 5. Before writing each follow-up question, check the full Q&A history — if the same topic was addressed before, skip it even if the answer was vague
@@ -254,11 +265,11 @@ OUTPUT FORMAT (JSON only, no other text):
       "references_understanding_field": "which field this addresses"
     }}
   ],
-  "final_confirmation": "summary if complete",
   "reward_hacking_check": {{
-    "potential_exploits": ["string"],
-    "mitigations": ["string"]
-  }}
+    "potential_exploits": ["at least 2 specific ways an agent could game the reward"],
+    "mitigations": ["at least 2 concrete fixes to prevent each exploit"]
+  }},
+  "final_confirmation": "summary if complete"
 }}"""
 
 # ---------------------------------------------------------------------------
@@ -284,6 +295,18 @@ CRITICAL:
 - Handle termination and truncation correctly
 - Include type hints where helpful
 - Make the code readable and well-structured
+- Use np_random (not np.random)
+- Use gymnasium.spaces (not gym.spaces)
+- Implement render() with a render_mode parameter in __init__ per the modern Gymnasium API spec.
+
+OBSERVATION ENCODING:
+Choose the most appropriate encoding automatically based on the domain:
+- Grid-based worlds: flat integer array (one value per cell) + scalar 
+  state variables appended at the end
+- Continuous physical systems: normalized float32 Box
+- Mixed structured state: Dict space with named components
+Document your encoding choice in the environment docstring so the user 
+understands what was chosen and why.
 
 OUTPUT FORMAT:
 Return ONLY valid Python code, no markdown, no explanations, no ```.
@@ -353,4 +376,8 @@ OUTPUT FORMAT (JSON only, no other text):
   "root_cause": "The specific line or logic that's broken",
   "fix_description": "How to fix it",
   "fixed_code": "The complete fixed Python code (no markdown, no ```)"
-}"""
+}
+
+Critical:
+- fixed_code must always be the COMPLETE Python code, not just the changed function.
+"""

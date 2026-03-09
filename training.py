@@ -2,7 +2,8 @@
 Step 6 – Training playground.
 
 Launches an SB3 training run in a subprocess, streams live reward data, and
-renders a matplotlib reward curve.  Supports PPO and SAC.
+renders a matplotlib reward curve.  Supports any algorithm registered in
+config.ALGORITHM_HYPERPARAMS (PPO, SAC, A2C, TD3, …).
 """
 
 import json
@@ -13,8 +14,11 @@ import tempfile
 import time
 import traceback
 
-from config import ALGORITHM_HYPERPARAMS
-from formatting import format_training_status
+import matplotlib
+matplotlib.use("Agg")
+
+from config import ALGORITHM_HYPERPARAMS, ALGORITHM_ACTION_SPACE_SUPPORT
+from formatting import format_training_status, _error_box
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +129,22 @@ if isinstance(env.observation_space, gym.spaces.Dict):
 policy = "MultiInputPolicy" if isinstance(env.observation_space, gym.spaces.Dict) else "MlpPolicy"
 print(f"Using policy: {{policy}}")
 
+# Action-space compatibility check for continuous-only algorithms (SAC, TD3, …)
+_algo_support = "{action_space_support}"
+if _algo_support == "continuous" and not isinstance(env.action_space, gym.spaces.Box):
+    print(
+        f"ERROR_ACTION_SPACE: {algorithm} requires a continuous (Box) action space, "
+        f"but got {{type(env.action_space).__name__}}. "
+        "Use PPO or A2C for discrete action spaces."
+    )
+    sys.exit(1)
+elif _algo_support == "discrete" and isinstance(env.action_space, gym.spaces.Box):
+    print(
+        f"ERROR_ACTION_SPACE: {algorithm} requires a discrete action space, "
+        f"but got Box. Use PPO or SAC for continuous action spaces."
+    )
+    sys.exit(1)
+
 try:
     model = {algorithm}(policy, env, verbose=0, {hyperparams})
     print(f"Model created: {algorithm}")
@@ -162,6 +182,11 @@ def run_training(env_code: str, algorithm: str, total_timesteps: int, provider: 
     """
     Generator that trains an SB3 agent and yields live status updates.
     Each ``yield`` is a tuple of ``(status_html, reward_plot_figure | None, log_text)``.
+
+    Supports any algorithm listed in config.ALGORITHM_HYPERPARAMS.
+    Algorithms marked as "continuous" in ALGORITHM_ACTION_SPACE_SUPPORT
+    (e.g. SAC, TD3) will fail if the environment uses a discrete action space —
+    the subprocess error will be captured and surfaced in the UI.
     """
     # NOTE: provider is not used during training (pure SB3 subprocess).
     # Reserved for future: auto-debug training failures via LLM.
@@ -170,7 +195,14 @@ def run_training(env_code: str, algorithm: str, total_timesteps: int, provider: 
 
     if not env_code or not env_code.strip():
         yield (
-            format_training_status("error", "No environment code found. Please generate code in Step 5 first."),
+            format_training_status("error", "No environment code found. Please generate code in Step 4 first."),
+            None, "",
+        )
+        return
+
+    if algorithm not in ALGORITHM_HYPERPARAMS:
+        yield (
+            format_training_status("error", f"Unknown algorithm '{algorithm}'. Check config.ALGORITHM_HYPERPARAMS."),
             None, "",
         )
         return
@@ -183,6 +215,7 @@ def run_training(env_code: str, algorithm: str, total_timesteps: int, provider: 
             f.write(env_code)
 
         hyperparams = ALGORITHM_HYPERPARAMS.get(algorithm, "")
+        action_space_support = ALGORITHM_ACTION_SPACE_SUPPORT.get(algorithm, "both")
         script = _TRAINING_SCRIPT.format(
             env_dir=tmpdir,
             env_path=env_path,
@@ -190,6 +223,7 @@ def run_training(env_code: str, algorithm: str, total_timesteps: int, provider: 
             hyperparams=hyperparams,
             total_timesteps=int(total_timesteps),
             log_path=log_path,
+            action_space_support=action_space_support,
         )
 
         script_path = os.path.join(tmpdir, "train.py")
@@ -304,27 +338,26 @@ def _build_reward_plot(episodes: list, rewards: list, algorithm: str):
         return None
 
     try:
-        import matplotlib
-        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
 
         fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(episodes, rewards, alpha=0.3, color="#90caf9", linewidth=1, label="Episode reward")
+        ax.plot(episodes, rewards, alpha=0.35, color="#5b9bd5", linewidth=1, label="Episode reward")
 
         if len(rewards) >= 5:
             window = max(5, len(rewards) // 20)
             smoothed = np.convolve(rewards, np.ones(window) / window, mode="valid")
-            ax.plot(episodes[window - 1:], smoothed, color="#1976d2", linewidth=2, label=f"Smoothed (w={window})")
+            ax.plot(episodes[window - 1:], smoothed, color="#2563eb", linewidth=2.5, label=f"Smoothed (w={window})")
 
-        ax.set_xlabel("Episode", color="#000000")
-        ax.set_ylabel("Total Reward", color="#000000")
-        ax.set_title(f"{algorithm} Training – Reward Curve", color="#000000", fontsize=13)
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(colors="#000000")
-        fig.patch.set_facecolor("#ffffff")
-        ax.set_facecolor("#f9f9f9")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Total Reward")
+        ax.set_title(f"{algorithm} Training — Reward Curve", fontsize=13, fontweight="bold")
+        ax.legend(loc="upper left", framealpha=0.85)
+        ax.grid(True, alpha=0.2, linestyle="--")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.patch.set_facecolor("none")  # transparent — adapts to dark/light mode
+        ax.set_facecolor("none")
         plt.tight_layout()
         return fig
 
