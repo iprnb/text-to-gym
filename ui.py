@@ -173,20 +173,18 @@ def build_demo() -> gr.Blocks:
         gr.Markdown("# 🤖 Text to Gym")
         gr.Markdown("### Transform a plain-language description into a working RL environment")
 
+        _available_providers = [p for p in ["ollama", "openai"]
+                                if (p == "ollama" and OLLAMA_API_KEY) or (p == "openai" and OPENAI_API_KEY)]
+        _default_provider = MODEL_PROVIDER if MODEL_PROVIDER in _available_providers else (_available_providers[0] if _available_providers else "ollama")
         with gr.Row():
             provider_dropdown = gr.Dropdown(
-                choices=["ollama", "openai"],
-                value=MODEL_PROVIDER,
+                choices=_available_providers or ["ollama", "openai"],
+                value=_default_provider,
                 label="🔧 Model Provider",
-                info="Select which LLM to use.",
+                info="Only providers with a configured API key are shown.",
                 scale=1,
             )
-            with gr.Column(scale=2):
-                gr.Markdown(
-                    f"**Settings:**\n"
-                    f"- Ollama: `{OLLAMA_MODEL}` {'✅' if OLLAMA_API_KEY else '❌ key not set'}\n"
-                    f"- OpenAI: `{OPENAI_MODEL}` {'✅' if OPENAI_API_KEY else '❌ key not set'}"
-                )
+            gr.Column(scale=3)  # spacer
 
         # ── Shared state ─────────────────────────────────────────────────────
         questions_json_state     = gr.State("")
