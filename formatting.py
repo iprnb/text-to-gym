@@ -471,7 +471,7 @@ def format_runtime_test_report(rounds: list, test_steps: int) -> str:
 
     footer_class = "ttg-card-info" if final_success else "ttg-card-warning"
     footer_msg = (
-        "✨ Code is SB3-compatible and ready for training! Proceed to Step 6."
+        "✨ Code is SB3-compatible and ready for training!"
         if final_success
         else "⚠️ Code still has issues. You can try again or proceed to the playground where you can re-test."
     )
